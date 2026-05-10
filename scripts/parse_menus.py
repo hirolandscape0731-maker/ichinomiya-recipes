@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Parse menu (献立表) PDFs into a structured per-day dish list.
+
+Two table formats exist:
+  - Standard (尾西/木曽川 etc.): day in row[0], all dishes in row[2] as newline-separated text
+  - 東浅井: day in row[1], each dish in its own row, dish cell has furigana as first line
+
+Output: data/menu_days.json, a flat list of day records.
+"""
+import json, re
+from pathlib import Path
+import pdfplumber
+
+ROOT = Path(__file__).resolve().parent.parent
+LIST_JSON = ROOT / "data" / "menu_pdf_list.json"
+DL_DIR = ROOT / "downloads" / "menus"
+OUT = ROOT / "data" / "menu_days.json"
+
+
+def normalize_cell(v) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def split_lines(s: str):
+    return [ln.strip() for ln in s.split("\n") if ln.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Standard format (尾西・木曽川 etc.): day in row[0]
+# ---------------------------------------------------------------------------
+
+def is_day_row_standard(row):
+    """Row[0] is a 1-2 digit day number."""
+    if not row or not row[0]:
+        return False
+    return bool(re.fullmatch(r"\d{1,2}", str(row[0]).strip()))
+
+
+def extract_day_records_standard(table):
+    for row in table:
+        if not is_day_row_standard(row):
+            continue
+        day = int(row[0].strip())
+        weekday = normalize_cell(row[1] if len(row) > 1 else "")
+        dish_text = normalize_cell(row[2] if len(row) > 2 else "")
+        dishes = split_lines(dish_text)
+        ing_cells = []
+        for c in row[3:-2] if len(row) > 5 else row[3:]:
+            s = normalize_cell(c)
+            if s:
+                ing_cells.append(s)
+        ingredients_blob = " ".join(ing_cells)
+        kcal = protein = ""
+        if len(row) >= 11:
+            m = re.search(r"\d+", normalize_cell(row[-2]))
+            if m:
+                kcal = m.group(0)
+            m = re.search(r"[\d.]+", normalize_cell(row[-1]))
+            if m:
+                protein = m.group(0)
+        yield {
+            "day": day, "weekday": weekday, "dishes": dishes,
+            "ingredients": ingredients_blob, "kcal": kcal, "protein_g": protein,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 東浅井 format: day in row[1], each dish in its own row, furigana as first line
+# ---------------------------------------------------------------------------
+
+def _count_kanji(s):
+    return sum(1 for c in s if "一" <= c <= "鿿")
+
+
+def _extract_dish_name_higashiazai(cell):
+    """Extract dish name from a cell that may have furigana as the first line(s).
+
+    Strategy: skip leading lines whose kanji count is less than the maximum kanji
+    count found anywhere in the cell.  This handles cases like:
+      - "ぎゅうにゅう はしづかいの日 / 牛乳" where 日 fools ratio tests
+      - "こんだて / ぎゅうにゅう / 牛乳" with 3-line furigana
+      - "あ / こまつなのこんぶ和え" where the dish has very few kanji
+    Falls back to the first line when the whole cell is hiragana (e.g., てりどり).
+    """
+    if not cell:
+        return None
+    lines = [ln.strip() for ln in str(cell).split("\n") if ln.strip()]
+    if not lines:
+        return None
+
+    # Filter sub-items (e.g. ＜とり団子＞) before computing max-kanji
+    content_lines = [ln for ln in lines if not re.match(r"^[<〈＜〔【]", ln)]
+    if not content_lines:
+        content_lines = lines
+
+    kanji_counts = [_count_kanji(ln) for ln in content_lines]
+    max_kanji = max(kanji_counts, default=0)
+
+    if max_kanji == 0:
+        result = content_lines[0]  # all-hiragana dish like てりどり
+    else:
+        result = next(
+            (ln for ln, cnt in zip(content_lines, kanji_counts) if cnt >= max_kanji),
+            content_lines[0],
+        )
+
+    # Strip leading non-word symbols like ◎ ☆ ★ ● ＊
+    result = re.sub(r"^[^぀-ヿ一-鿿\w]+", "", result)
+
+    # Skip footnote-like strings (Japanese sentences end with 。)
+    if "。" in result:
+        return None
+
+    return result or None
+
+
+def _get_kcal(row):
+    """Return the kcal value from row[-2] if it's >200, else 0."""
+    try:
+        v = float(str(row[-2]).strip()) if row and len(row) >= 2 and row[-2] else 0
+        return v if v > 200 else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def extract_day_records_higashiazai(table):
+    """Parse 東浅井 format using kcal rows as day-boundary markers.
+
+    Each day's block:
+      row[k-1]  = ご飯/パン  (first dish, no day number)
+      row[k]    = 牛乳 with large kcal  (kcal marker)
+      row[k+1…] = main dishes; one of them has the day number in col[1]
+    """
+    # Pass 1: find kcal row indices (牛乳 rows with total kcal > 200)
+    kcal_indices = [
+        i for i, row in enumerate(table)
+        if row and len(row) >= 2 and _get_kcal(row) > 0
+    ]
+    if not kcal_indices:
+        return
+
+    # Pass 2: iterate day blocks
+    for n, k in enumerate(kcal_indices):
+        start = max(0, k - 1)  # ご飯 row is exactly one before 牛乳
+        if n + 1 < len(kcal_indices):
+            end = kcal_indices[n + 1] - 2  # last row before next day's ご飯
+        else:
+            end = len(table) - 1
+
+        day_num = None
+        weekday = ""
+        dishes = []
+        ing_parts = []
+
+        for i in range(start, end + 1):
+            row = table[i]
+            if not row or len(row) < 4:
+                continue
+
+            col1 = str(row[1]).strip() if row[1] else ""
+            col2 = str(row[2]).strip() if row[2] else ""
+            col3 = row[3]
+
+            # Day anchor: col[1] is a 1-2 digit number
+            if re.fullmatch(r"\d{1,2}", col1):
+                day_num = int(col1)
+                weekday = col2
+
+            # Dish name
+            dish = _extract_dish_name_higashiazai(col3)
+            if dish and not re.match(r"^[<〈＜〔【]", dish):
+                dishes.append(dish)
+
+            # Ingredients: middle columns (col[4] to col[-3])
+            for c in row[4:-2]:
+                s = str(c).strip() if c else ""
+                if s and s != "None":
+                    ing_parts.append(s)
+
+        if day_num is not None and dishes:
+            yield {
+                "day": day_num, "weekday": weekday, "dishes": dishes,
+                "ingredients": " ".join(ing_parts), "kcal": "", "protein_g": "",
+            }
+
+
+# ---------------------------------------------------------------------------
+# Format detection and unified entry point
+# ---------------------------------------------------------------------------
+
+def detect_format(table):
+    """Return 'standard' or 'higashiazai' based on table structure."""
+    for row in table[2:15]:
+        if not row:
+            continue
+        # Standard: row[0] is a digit
+        if row[0] and re.fullmatch(r"\d{1,2}", str(row[0]).strip()):
+            return "standard"
+        # 東浅井: row[0] is None, row[1] is a digit
+        if not row[0] and row[1] and re.fullmatch(r"\d{1,2}", str(row[1]).strip()):
+            return "higashiazai"
+    return "standard"
+
+
+def extract_day_records(pdf_path: Path):
+    """Yield day-record dicts from a single menu PDF, auto-detecting format."""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for t in tables:
+                fmt = detect_format(t)
+                if fmt == "higashiazai":
+                    yield from extract_day_records_higashiazai(t)
+                else:
+                    yield from extract_day_records_standard(t)
+
+
+def main():
+    menu_records = json.loads(LIST_JSON.read_text(encoding="utf-8"))
+    out = []
+    for i, m in enumerate(menu_records, 1):
+        pdf = DL_DIR / m["filename"]
+        if not pdf.exists():
+            continue
+        count_before = len(out)
+        try:
+            for day in extract_day_records(pdf):
+                date = f"{m['year']:04d}-{m['month']:02d}-{day['day']:02d}"
+                out.append({
+                    "date": date,
+                    "school_type": m["school_type"],
+                    "area": m["area"],
+                    **day,
+                    "source_pdf": m["url"],
+                })
+        except Exception as e:
+            print(f"[{i}] error parsing {m['filename']}: {e}")
+        count = len(out) - count_before
+        print(f"[{i}] {m['filename']}: {count} days")
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for r in out:
+        key = (r["date"], r["school_type"], r["area"], "|".join(r["dishes"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    unique.sort(key=lambda r: (r["date"], r["school_type"], r["area"]))
+
+    OUT.write_text(json.dumps(unique, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nWrote {len(unique)} day-records -> {OUT}")
+    print(f"  unique dates: {len(set(r['date'] for r in unique))}")
+    print(f"  total dishes: {sum(len(r['dishes']) for r in unique)}")
+
+
+if __name__ == "__main__":
+    main()
